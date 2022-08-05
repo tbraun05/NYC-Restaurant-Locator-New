@@ -1,185 +1,232 @@
-# Copyright 2009-present MongoDB, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Extensions to the 'distutils' for large or complex distributions"""
 
-"""Python driver for MongoDB."""
+import os
+import functools
+import distutils.core
+import distutils.filelist
+import re
+from distutils.errors import DistutilsOptionError
+from distutils.util import convert_path
+from fnmatch import fnmatchcase
 
-from typing import ContextManager, Optional, Tuple, Union
+from ._deprecation_warning import SetuptoolsDeprecationWarning
+
+from setuptools.extern.six import PY3, string_types
+from setuptools.extern.six.moves import filter, map
+
+import setuptools.version
+from setuptools.extension import Extension
+from setuptools.dist import Distribution
+from setuptools.depends import Require
+from . import monkey
+
+__metaclass__ = type
+
 
 __all__ = [
-    "ASCENDING",
-    "DESCENDING",
-    "GEO2D",
-    "GEOSPHERE",
-    "HASHED",
-    "TEXT",
-    "version_tuple",
-    "get_version_string",
-    "__version__",
-    "version",
-    "ReturnDocument",
-    "MAX_SUPPORTED_WIRE_VERSION",
-    "MIN_SUPPORTED_WIRE_VERSION",
-    "CursorType",
-    "MongoClient",
-    "DeleteMany",
-    "DeleteOne",
-    "IndexModel",
-    "InsertOne",
-    "ReplaceOne",
-    "UpdateMany",
-    "UpdateOne",
-    "ReadPreference",
-    "WriteConcern",
-    "has_c",
-    "timeout",
+    'setup', 'Distribution', 'Command', 'Extension', 'Require',
+    'SetuptoolsDeprecationWarning',
+    'find_packages'
 ]
 
-ASCENDING = 1
-"""Ascending sort order."""
-DESCENDING = -1
-"""Descending sort order."""
+if PY3:
+    __all__.append('find_namespace_packages')
 
-GEO2D = "2d"
-"""Index specifier for a 2-dimensional `geospatial index`_.
+__version__ = setuptools.version.__version__
 
-.. _geospatial index: http://mongodb.com/docs/manual/core/2d/
-"""
+bootstrap_install_from = None
 
-GEOSPHERE = "2dsphere"
-"""Index specifier for a `spherical geospatial index`_.
-
-.. versionadded:: 2.5
-
-.. _spherical geospatial index: http://mongodb.com/docs/manual/core/2dsphere/
-"""
-
-HASHED = "hashed"
-"""Index specifier for a `hashed index`_.
-
-.. versionadded:: 2.5
-
-.. _hashed index: http://mongodb.com/docs/manual/core/index-hashed/
-"""
-
-TEXT = "text"
-"""Index specifier for a `text index`_.
-
-.. seealso:: MongoDB's `Atlas Search
-   <https://docs.atlas.mongodb.com/atlas-search/>`_ which offers more advanced
-   text search functionality.
-
-.. versionadded:: 2.7.1
-
-.. _text index: http://mongodb.com/docs/manual/core/index-text/
-"""
-
-version_tuple: Tuple[Union[int, str], ...] = (4, 2, 0)
+# If we run 2to3 on .py files, should we also convert docstrings?
+# Default: yes; assume that we can detect doctests reliably
+run_2to3_on_doctests = True
+# Standard package names for fixer packages
+lib2to3_fixer_packages = ['lib2to3.fixes']
 
 
-def get_version_string() -> str:
-    if isinstance(version_tuple[-1], str):
-        return ".".join(map(str, version_tuple[:-1])) + version_tuple[-1]
-    return ".".join(map(str, version_tuple))
-
-
-__version__: str = get_version_string()
-version = __version__
-
-"""Current version of PyMongo."""
-
-from pymongo import _csot
-from pymongo.collection import ReturnDocument
-from pymongo.common import MAX_SUPPORTED_WIRE_VERSION, MIN_SUPPORTED_WIRE_VERSION
-from pymongo.cursor import CursorType
-from pymongo.mongo_client import MongoClient
-from pymongo.operations import (
-    DeleteMany,
-    DeleteOne,
-    IndexModel,
-    InsertOne,
-    ReplaceOne,
-    UpdateMany,
-    UpdateOne,
-)
-from pymongo.read_preferences import ReadPreference
-from pymongo.write_concern import WriteConcern
-
-
-def has_c() -> bool:
-    """Is the C extension installed?"""
-    try:
-        from pymongo import _cmessage  # type: ignore[attr-defined] # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-def timeout(seconds: Optional[float]) -> ContextManager:
-    """**(Provisional)** Apply the given timeout for a block of operations.
-
-    .. note:: :func:`~pymongo.timeout` is currently provisional. Backwards
-       incompatible changes may occur before becoming officially supported.
-
-    Use :func:`~pymongo.timeout` in a with-statement::
-
-      with pymongo.timeout(5):
-          client.db.coll.insert_one({})
-          client.db.coll2.insert_one({})
-
-    When the with-statement is entered, a deadline is set for the entire
-    block. When that deadline is exceeded, any blocking pymongo operation
-    will raise a timeout exception. For example::
-
-      try:
-          with pymongo.timeout(5):
-              client.db.coll.insert_one({})
-              time.sleep(5)
-              # The deadline has now expired, the next operation will raise
-              # a timeout exception.
-              client.db.coll2.insert_one({})
-      except PyMongoError as exc:
-          if exc.timeout:
-              print(f"block timed out: {exc!r}")
-          else:
-              print(f"failed with non-timeout error: {exc!r}")
-
-    When nesting :func:`~pymongo.timeout`, the newly computed deadline is capped to at most
-    the existing deadline. The deadline can only be shortened, not extended.
-    When exiting the block, the previous deadline is restored::
-
-      with pymongo.timeout(5):
-          coll.find_one()  # Uses the 5 second deadline.
-          with pymongo.timeout(3):
-              coll.find_one() # Uses the 3 second deadline.
-          coll.find_one()  # Uses the original 5 second deadline.
-          with pymongo.timeout(10):
-              coll.find_one()  # Still uses the original 5 second deadline.
-          coll.find_one()  # Uses the original 5 second deadline.
-
-    :Parameters:
-      - `seconds`: A non-negative floating point number expressing seconds, or None.
-
-    :Raises:
-      - :py:class:`ValueError`: When `seconds` is negative.
-
-    .. versionadded:: 4.2
+class PackageFinder:
     """
-    if not isinstance(seconds, (int, float, type(None))):
-        raise TypeError("timeout must be None, an int, or a float")
-    if seconds and seconds < 0:
-        raise ValueError("timeout cannot be negative")
-    if seconds is not None:
-        seconds = float(seconds)
-    return _csot._TimeoutContext(seconds)
+    Generate a list of all Python packages found within a directory
+    """
+
+    @classmethod
+    def find(cls, where='.', exclude=(), include=('*',)):
+        """Return a list all Python packages found within directory 'where'
+
+        'where' is the root directory which will be searched for packages.  It
+        should be supplied as a "cross-platform" (i.e. URL-style) path; it will
+        be converted to the appropriate local path syntax.
+
+        'exclude' is a sequence of package names to exclude; '*' can be used
+        as a wildcard in the names, such that 'foo.*' will exclude all
+        subpackages of 'foo' (but not 'foo' itself).
+
+        'include' is a sequence of package names to include.  If it's
+        specified, only the named packages will be included.  If it's not
+        specified, all found packages will be included.  'include' can contain
+        shell style wildcard patterns just like 'exclude'.
+        """
+
+        return list(cls._find_packages_iter(
+            convert_path(where),
+            cls._build_filter('ez_setup', '*__pycache__', *exclude),
+            cls._build_filter(*include)))
+
+    @classmethod
+    def _find_packages_iter(cls, where, exclude, include):
+        """
+        All the packages found in 'where' that pass the 'include' filter, but
+        not the 'exclude' filter.
+        """
+        for root, dirs, files in os.walk(where, followlinks=True):
+            # Copy dirs to iterate over it, then empty dirs.
+            all_dirs = dirs[:]
+            dirs[:] = []
+
+            for dir in all_dirs:
+                full_path = os.path.join(root, dir)
+                rel_path = os.path.relpath(full_path, where)
+                package = rel_path.replace(os.path.sep, '.')
+
+                # Skip directory trees that are not valid packages
+                if ('.' in dir or not cls._looks_like_package(full_path)):
+                    continue
+
+                # Should this package be included?
+                if include(package) and not exclude(package):
+                    yield package
+
+                # Keep searching subdirectories, as there may be more packages
+                # down there, even if the parent was excluded.
+                dirs.append(dir)
+
+    @staticmethod
+    def _looks_like_package(path):
+        """Does a directory look like a package?"""
+        return os.path.isfile(os.path.join(path, '__init__.py'))
+
+    @staticmethod
+    def _build_filter(*patterns):
+        """
+        Given a list of patterns, return a callable that will be true only if
+        the input matches at least one of the patterns.
+        """
+        return lambda name: any(fnmatchcase(name, pat=pat) for pat in patterns)
+
+
+class PEP420PackageFinder(PackageFinder):
+    @staticmethod
+    def _looks_like_package(path):
+        return True
+
+
+find_packages = PackageFinder.find
+
+if PY3:
+    find_namespace_packages = PEP420PackageFinder.find
+
+
+def _install_setup_requires(attrs):
+    # Note: do not use `setuptools.Distribution` directly, as
+    # our PEP 517 backend patch `distutils.core.Distribution`.
+    dist = distutils.core.Distribution(dict(
+        (k, v) for k, v in attrs.items()
+        if k in ('dependency_links', 'setup_requires')
+    ))
+    # Honor setup.cfg's options.
+    dist.parse_config_files(ignore_option_errors=True)
+    if dist.setup_requires:
+        dist.fetch_build_eggs(dist.setup_requires)
+
+
+def setup(**attrs):
+    # Make sure we have any requirements needed to interpret 'attrs'.
+    _install_setup_requires(attrs)
+    return distutils.core.setup(**attrs)
+
+
+setup.__doc__ = distutils.core.setup.__doc__
+
+
+_Command = monkey.get_unpatched(distutils.core.Command)
+
+
+class Command(_Command):
+    __doc__ = _Command.__doc__
+
+    command_consumes_arguments = False
+
+    def __init__(self, dist, **kw):
+        """
+        Construct the command for dist, updating
+        vars(self) with any keyword parameters.
+        """
+        _Command.__init__(self, dist)
+        vars(self).update(kw)
+
+    def _ensure_stringlike(self, option, what, default=None):
+        val = getattr(self, option)
+        if val is None:
+            setattr(self, option, default)
+            return default
+        elif not isinstance(val, string_types):
+            raise DistutilsOptionError("'%s' must be a %s (got `%s`)"
+                                       % (option, what, val))
+        return val
+
+    def ensure_string_list(self, option):
+        r"""Ensure that 'option' is a list of strings.  If 'option' is
+        currently a string, we split it either on /,\s*/ or /\s+/, so
+        "foo bar baz", "foo,bar,baz", and "foo,   bar baz" all become
+        ["foo", "bar", "baz"].
+        """
+        val = getattr(self, option)
+        if val is None:
+            return
+        elif isinstance(val, string_types):
+            setattr(self, option, re.split(r',\s*|\s+', val))
+        else:
+            if isinstance(val, list):
+                ok = all(isinstance(v, string_types) for v in val)
+            else:
+                ok = False
+            if not ok:
+                raise DistutilsOptionError(
+                    "'%s' must be a list of strings (got %r)"
+                    % (option, val))
+
+    def reinitialize_command(self, command, reinit_subcommands=0, **kw):
+        cmd = _Command.reinitialize_command(self, command, reinit_subcommands)
+        vars(cmd).update(kw)
+        return cmd
+
+
+def _find_all_simple(path):
+    """
+    Find all files under 'path'
+    """
+    results = (
+        os.path.join(base, file)
+        for base, dirs, files in os.walk(path, followlinks=True)
+        for file in files
+    )
+    return filter(os.path.isfile, results)
+
+
+def findall(dir=os.curdir):
+    """
+    Find all files under 'dir' and return the list of full filenames.
+    Unless dir is '.', return full filenames with dir prepended.
+    """
+    files = _find_all_simple(dir)
+    if dir == os.curdir:
+        make_rel = functools.partial(os.path.relpath, start=dir)
+        files = map(make_rel, files)
+    return list(files)
+
+
+class sic(str):
+    """Treat this string as-is (https://en.wikipedia.org/wiki/Sic)"""
+
+
+# Apply monkey patches
+monkey.patch_all()
